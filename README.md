@@ -14,12 +14,12 @@
   - [Phase 2: Tree Objects](#phase-2-tree-objects)
   - [Phase 3: The Index (Staging Area)](#phase-3-the-index-staging-area)
   - [Phase 4: Commits and History](#phase-4-commits-and-history)
-- [Design Analysis](#design-analysis)
-  - [Branching and Checkout](#branching-and-checkout)
-  - [Detecting a Dirty Working Directory](#detecting-a-dirty-working-directory)
-  - [Detached HEAD State](#detached-head-state)
-  - [Garbage Collection Algorithm](#garbage-collection-algorithm)
-  - [GC Race Conditions](#gc-race-conditions)
+- [Phase 5 & 6: Analysis Questions](#phase-5--6-analysis-questions)
+  - [Q5.1: Branching and Checkout Implementation](#q51-branching-and-checkout-implementation)
+  - [Q5.2: Detecting a Dirty Working Directory](#q52-detecting-a-dirty-working-directory)
+  - [Q5.3: Detached HEAD State](#q53-detached-head-state)
+  - [Q6.1: Garbage Collection Algorithm](#q61-garbage-collection-algorithm)
+  - [Q6.2: GC Race Conditions](#q62-gc-race-conditions)
 
 ---
 
@@ -150,35 +150,24 @@ make test-integration
 
 ---
 
-## Design Analysis
+## Phase 5 & 6: Analysis Questions
 
-### Branching and Checkout
+### Q5.1: Branching and Checkout Implementation
 
-To implement `pes checkout <branch>`, the system reads the target commit hash from the branch reference file and updates `.pes/HEAD`. The more complex part is safely updating the working directory: the system must recursively traverse the target commit's tree and mirror those files to disk, while refusing to overwrite any uncommitted work the user currently has.
+To implement a `pes checkout <branch>` command, the system needs to read the commit hash from the target branch file and update the `.pes/HEAD` file to point to it. The complex part is updating the working directory safely: the system must recursively traverse the target commit's tree and mirror those files to the working directory while aggressively ensuring it doesn't accidentally overwrite any uncommitted, unsaved work the user currently has open.
 
-### Detecting a Dirty Working Directory
+### Q5.2: Detecting a "Dirty" Working Directory
 
-Conflict detection uses a three-way check without rehashing everything:
+To figure out if a checkout will cause a conflict without rehashing everything, we do a quick three-way check. First, we compare the current branch's tree with the target branch's tree to see if the file actually differs. Then, we look at the `.pes/index` file; if a file's metadata in the index differs from the current branch's baseline, it means the user has modified or staged it. If the file is modified *and* it differs between the two branches, we have a dirty conflict and must refuse the checkout to protect the user's work.
 
-1. **Compare trees** — diff the current branch's tree against the target branch's tree to identify which files actually differ between them.
-2. **Check the index** — if a file's metadata in the index diverges from the current branch's baseline, the user has modified or staged it locally.
-3. **Conflict decision** — if a file is locally modified *and* differs between the two branches, the checkout is refused to protect unsaved work.
+### Q5.3: Detached HEAD State
 
-### Detached HEAD State
+If you commit while in a detached HEAD state, the commit object successfully saves to the object store, and `HEAD` updates to point directly at that new hash. However, because no branch pointer (like `main`) is updated, the moment you switch to another branch, those new commits become "orphaned" and invisible to standard logs. To get them back, a user has to dig up the exact hash of the orphaned commit and manually create a new branch pointer directed right at it.
 
-When committing in a detached HEAD state, the commit object is saved correctly to the object store and `HEAD` is updated to point directly at the new hash. However, since no branch pointer (e.g., `main`) is updated, switching branches immediately orphans those commits — they become unreachable by standard log traversal. Recovery requires finding the exact orphaned commit hash and manually creating a new branch reference pointing to it.
+### Q6.1: Garbage Collection Algorithm
 
-### Garbage Collection Algorithm
+To clean up a massive repository, a mark-and-sweep algorithm using a Hash Set is the best approach. In the **mark phase**, we start at every branch reference in `.pes/refs/heads/`, walk backwards through all parent commits, and tag every commit, tree, and blob hash we encounter as "reachable" by adding them to the Hash Set (which gives us O(1) lookups). In the **sweep phase**, we loop through the actual `.pes/objects/` folder and delete any file whose hash isn't in our set. For a repo with 100k commits, we'd have to traverse millions of blobs and subtrees during the mark phase, but the sweep itself would be highly efficient.
 
-A **mark-and-sweep** using a hash set is the correct approach for cleaning a large repository:
+### Q6.2: GC Race Conditions
 
-- **Mark phase** — Starting from every branch reference in `.pes/refs/heads/`, walk backwards through parent commits and add every reachable commit, tree, and blob hash to a hash set (O(1) membership checks).
-- **Sweep phase** — Iterate through all files in `.pes/objects/` and delete any whose hash is absent from the set.
-
-For a repository with 100k commits, the mark phase must traverse millions of blobs and subtrees, but the sweep itself is highly efficient given O(1) lookups.
-
-### GC Race Conditions
-
-Running GC concurrently with active commits introduces a dangerous race condition. For example: `pes add file.txt` creates a new blob object; if GC sweeps at that instant — before `pes commit` links it into a tree — the blob is deleted because it isn't yet reachable from any commit, corrupting the in-progress commit.
-
-Git mitigates this with a **grace period** (typically two weeks): GC only deletes unreachable objects whose file timestamps prove they are genuinely old and abandoned, leaving recently created objects untouched regardless of reachability.
+Running GC in the background while someone is committing is a recipe for disaster due to race conditions. For example, if a user runs `pes add file.txt`, a blob is generated; if GC sweeps right at that millisecond before `pes commit` runs, it will delete the new blob because it isn't linked to a commit tree yet, completely corrupting the upcoming commit. Git solves this by enforcing a grace period — usually two weeks — meaning the GC will only delete unreachable objects if their file timestamps prove they are genuinely old and abandoned, ignoring freshly minted files entirely.
